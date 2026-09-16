@@ -129,7 +129,8 @@ function appearance(p){
   const category=(p.tags||[]).find(t=>colorSeries[t])||((p.tags||[])[0]||'默认');
   const series=colorSeries[category]||{h:hash(category)%360,s:88};
   const light=40+(n%4)*5, sat=Math.max(82,series.s), bg=`hsl(${series.h}, ${sat}%, ${light}%)`, fg=light>62?'#15171a':'#fff';
-  return{style:`--book:${bg};--type:${fg};--w:${34+h%27}px;--h:${181+h%80}px;--size:${15+h%5}px;--series-hue:${series.h}`,kind:['','ink','label','band'][n%4],width:34+h%27,category}
+  const height=p.demo?[180,300,230][p.index%3]:166+hash('height:'+(p.id||p.title))%139;
+  return{style:`--book:${bg};--type:${fg};--w:${34+h%27}px;--h:${height}px;--size:${15+h%5}px;--series-hue:${series.h}`,kind:['','ink','label','band'][n%4],width:34+h%27,category}
 }
 function notify(s){clearTimeout(toastTimer);const t=$('#toast');t.textContent=s;t.classList.add('show');toastTimer=setTimeout(()=>t.classList.remove('show'),2800)}
 async function refresh(){papers=(await all()).map(p=>({...p,tags:p.tags||[]}));render()}
