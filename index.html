@@ -217,6 +217,9 @@ let lastWidth=0;new ResizeObserver(entries=>{const w=entries[0].contentRect.widt
 
 
 
+
+
+
 <!-- citation-upgrade:start -->
 <style>
 /* Citation tools share the existing white, quiet detail card. */
@@ -243,6 +246,7 @@ let lastWidth=0;new ResizeObserver(entries=>{const w=entries[0].contentRect.widt
 .batch-item .citation-note{margin:5px 0!important}
 #recognitionProgress{font-size:12px;color:var(--muted);line-height:1.7;margin-bottom:14px}
 #metaDialog{width:min(580px,calc(100% - 32px))}
+.translation-panel{border-top:1px solid var(--line);margin-top:24px;padding-top:20px}.translation-panel h3{font-size:17px;margin:0 0 8px}.translation-panel p{font-size:12px;color:var(--muted);line-height:1.7}.translation-actions{display:flex;gap:8px;flex-wrap:wrap}.translation-output{display:grid;gap:14px;margin-top:14px;max-height:52vh;overflow:auto}.translation-block{background:#f5f5f7;border-radius:12px;padding:14px;font-size:13px;line-height:1.8}.translation-block small{display:block;color:var(--muted);font-size:10px;margin-bottom:6px}.translation-key{display:flex;gap:8px;margin:12px 0}.translation-key input{flex:1;border:1px solid var(--line);border-radius:10px;padding:10px;background:#fff}
 @media(max-width:540px){.citation-fields-grid{grid-template-columns:1fr}.citation-fields-grid .wide{grid-column:auto}.citation-preview{padding:14px;font-size:13px}.citation-heading{align-items:flex-start}.citation-heading select{width:100%}}
 
 </style>
@@ -408,10 +412,27 @@ $('#metaForm').onsubmit=saveFiles;
 function citationPanel(p){const missing=missingCitation(p),c=p.citation||{};return '<section class="citation-panel" aria-label="参考文献"><div class="citation-heading"><h3>参考文献</h3><select class="field" id="citationStyle" aria-label="参考文献格式"><option value="gb" '+(citationStyle==='gb'?'selected':'')+'>GB/T 7714—2015</option><option value="apa" '+(citationStyle==='apa'?'selected':'')+'>APA 7 · 纯文本</option></select></div><div class="citation-preview" id="citationPreview">'+safe(citationText(p,citationStyle))+'</div><p class="citation-note '+(missing.length?'citation-warning':'')+'" id="citationCompleteness">'+(missing.length?'引用草稿 · 待补充：'+safe(missing.join('、')):'引用已生成 · 提交前请核对作者、出版信息和 PDF 版本。')+'</p><div class="citation-actions"><button class="save" data-citation-action="copy">复制引用</button><button class="ghost" data-citation-action="txt">导出 TXT</button><button class="ghost" data-citation-action="bib">BibTeX</button><button class="ghost" data-citation-action="ris">RIS</button></div><p class="citation-note" id="citationStatus" role="status">'+safe(p.demo?'示例预览；导入 PDF 后可自动识别与校正。':(c.source||'尚未识别这份 PDF，可点击下方按钮。')+(c.note?' · '+c.note:''))+'</p>'+(p.demo?'':'<div class="citation-actions"><button class="ghost" data-citation-action="recognize">'+(citationJobs.has(p.id)?'识别中…':'识别 PDF')+'</button><button class="ghost" data-citation-action="lookup">用 DOI 联网补全</button><button class="ghost" data-citation-action="ocr">扫描件 OCR</button><button class="ghost" data-citation-action="edit">校正文献信息</button></div><p class="citation-note">PDF 不上传。DOI 补全仅发送 DOI；OCR 在本地运行，首次需下载中英文语言包。识别只填充空白项，保留你的已有信息。</p>')+'</section>'}
 const baseShowDetail=showDetail;
 showDetail=function(id){baseShowDetail(id);const p=find(id);if(!p)return;$('#detailContent').insertAdjacentHTML('beforeend',citationPanel(p));$('#citationStyle').onchange=e=>{citationStyle=e.target.value;$('#citationPreview').textContent=citationText(find(selectedId),citationStyle)};if(citationJobs.has(id))$('#detailContent').querySelectorAll('[data-citation-action]').forEach(b=>{b.disabled=true})};
+
+async function translatePaper(p){
+  if(!p.file)return notify('示例文献没有 PDF');
+  let key='';try{key=localStorage.getItem('paper-vault-translate-key')||''}catch(e){}
+  if(!key){key=prompt('请输入 OpenAI API Key（只保存在本机，不会写入论文）');if(!key)return;try{localStorage.setItem('paper-vault-translate-key',key)}catch(e){}}
+  const panel=$('#translationOutput');if(!panel)return;panel.textContent='正在提取文献正文…';
+  try{const engine=await pdfEngine(),doc=await engine.getDocument({data:new Uint8Array(await p.file.arrayBuffer()),isEvalSupported:false}).promise,blocks=[];
+    for(let i=1;i<=Math.min(doc.numPages,30);i++){const page=await doc.getPage(i),text=(await page.getTextContent()).items.map(x=>x.str).join(' ').replace(/\s+/g,' ').trim();if(text)blocks.push('第 '+i+' 页\n'+text)}
+    if(!blocks.length)throw new Error('未提取到文字；扫描件请先使用 OCR');
+    panel.textContent='正在翻译 '+blocks.length+' 页…';const out=[];
+    for(let i=0;i<blocks.length;i++){const content=blocks[i].slice(0,12000);const res=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},body:JSON.stringify({model:'gpt-4o-mini',temperature:.1,messages:[{role:'system',content:'你是学术翻译助手。将英文论文内容准确翻译成简体中文，保留公式、编号、引用标记和术语；只输出中文译文。'},{role:'user',content} ]})});if(!res.ok)throw new Error('翻译服务返回 '+res.status);const data=await res.json();out.push({original:content,translated:data.choices?.[0]?.message?.content||''});panel.innerHTML=out.map(x=>'<article class="translation-block"><small>原文</small>'+safe(x.original)+'<hr><small>中文译文</small>'+safe(x.translated)+'</article>').join('');}
+  }catch(e){panel.textContent='翻译未完成：'+e.message}
+}
+function translationPanel(p){return p.demo?'':'<section class="translation-panel"><h3>全文翻译</h3><p>提取英文正文并分段翻译为中文，结果只显示在本机页面。翻译服务会收到文献文字，请确认你有权使用。</p><div class="translation-actions"><button class="save" data-citation-action="translate">翻译文献内容</button><button class="ghost" data-citation-action="clear-translate-key">清除本机 API Key</button></div><div class="translation-output" id="translationOutput"></div></section>'}
+const oldShow=showDetail;showDetail=function(id){oldShow(id);const p=find(id);if(p&&!p.demo)$('#detailContent').insertAdjacentHTML('beforeend',translationPanel(p))};
 function fillMissingPaper(p,r){const citation={...p.citation};for(const [k,v]of Object.entries(r.citation||{}))if((!citation[k]||citation[k]==='unknown')&&v)citation[k]=v;citation.source=r.citation?.source||citation.source;citation.note=r.citation?.note||'';return {...p,title:p.title||r.title,authors:p.authors||r.authors,citation}}
 $('#detailContent').addEventListener('click',async e=>{
   const b=e.target.closest('[data-citation-action]');if(!b)return;const p=find(selectedId);if(!p)return;const action=b.dataset.citationAction;
   if(action==='edit')return editPaper();
+  if(action==='translate')return translatePaper(p);
+  if(action==='clear-translate-key'){try{localStorage.removeItem('paper-vault-translate-key')}catch(e){}notify('已清除本机 API Key');return}
   if(action==='copy'){try{await navigator.clipboard.writeText(citationText(p,citationStyle));notify(missingCitation(p).length?'引用草稿已复制，请补齐缺失项':'参考文献已复制')}catch(e){const range=document.createRange();range.selectNodeContents($('#citationPreview'));const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);notify('已选中引用，请按 ⌘C / Ctrl+C 复制')}return}
   if(['txt','bib','ris'].includes(action)){downloadCitation(p,action);if(missingCitation(p).length)notify('已导出引用草稿，部分出版信息仍需补充');return}
   if(p.demo||citationJobs.has(p.id))return;
