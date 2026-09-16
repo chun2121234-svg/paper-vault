@@ -214,5 +214,217 @@ const seriesDialog=$('#seriesDialog');$('#seriesBtn').onclick=openSeries;$('#clo
 let lastWidth=0;new ResizeObserver(entries=>{const w=entries[0].contentRect.width;if(Math.abs(w-lastWidth)>1){lastWidth=w;if(db)renderShelves()}}).observe(grid);
 (async()=>{try{db=await openDB();await refresh();$('#addBtn').disabled=false;$('#dropZone').disabled=false}catch(e){$('#resultText').textContent='无法打开本地资料库';grid.innerHTML='<div class="empty"><b>无法启用本地存储</b>请使用支持本地存储的浏览器打开。</div>';console.error(e)}})();
 </script>
+
+
+
+<!-- citation-upgrade:start -->
+<style>
+/* Citation tools share the existing white, quiet detail card. */
+[hidden]{display:none!important}
+.citation-panel{border-top:1px solid var(--line);margin-top:30px;padding-top:24px}
+.citation-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.citation-heading h3{font-size:17px;font-weight:600;letter-spacing:-.3px;margin:0}
+.citation-heading select{max-width:100%;font-size:12px;padding:8px 10px}
+.citation-preview{font-size:14px;line-height:1.85;white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f5f7;border-radius:14px;padding:18px;margin:16px 0 10px;user-select:text}
+.citation-note{font-size:12px!important;line-height:1.7!important;margin:8px 0 14px!important;color:var(--muted)}
+.citation-warning{color:#8a5700!important}
+.citation-actions{display:flex;flex-wrap:wrap;gap:8px}
+.citation-actions button{font-size:12px;padding:9px 14px}
+.citation-fields{margin-top:4px;border-top:1px solid var(--line);padding-top:16px}
+.citation-fields summary{cursor:pointer;font-size:13px;font-weight:500}
+.citation-fields-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px}
+.citation-fields-grid label{min-width:0}
+.citation-fields-grid .wide{grid-column:1/-1}
+.citation-fields-grid select{width:100%;margin-top:6px;border:1px solid var(--line);background:#fafafa;padding:11px}
+.recognition-options{display:grid;gap:10px;background:#f5f5f7;border-radius:12px;padding:14px;margin:0 0 18px}
+.recognition-options label{display:flex;align-items:flex-start;gap:8px;font-size:12px;line-height:1.6}
+.recognition-options input{margin-top:4px;flex-shrink:0}
+.recognition-options small{font-size:11px;line-height:1.65;color:var(--muted)}
+.batch-item .citation-note{margin:5px 0!important}
+#recognitionProgress{font-size:12px;color:var(--muted);line-height:1.7;margin-bottom:14px}
+#metaDialog{width:min(580px,calc(100% - 32px))}
+@media(max-width:540px){.citation-fields-grid{grid-template-columns:1fr}.citation-fields-grid .wide{grid-column:auto}.citation-preview{padding:14px;font-size:13px}.citation-heading{align-items:flex-start}.citation-heading select{width:100%}}
+
+</style>
+<script>
+/* Paper Vault citations. Parsing/OCR run locally; only an explicitly enabled DOI lookup leaves the device. */
+const CITE_TYPES={unknown:'待确认',article:'期刊论文',book:'图书',chapter:'书籍章节',conference:'会议论文',thesis:'学位论文',preprint:'预印本 / 在线文献'};
+const CITE_FIELDS=[['type','文献类型'],['year','出版年份'],['container','期刊 / 会议录 / 书名'],['publisher','出版社 / 学位授予单位'],['place','出版地'],['volume','卷'],['issue','期'],['pages','页码 / 文章编号'],['edition','版次'],['doi','DOI'],['url','文献网址']];
+let citationStyle='gb',recognitionController=null,importDrafts=[],recognizing=false,pdfModulePromise,ocrModulePromise;
+const citationJobs=new Set();
+samples[0].citation={type:'conference'};samples[1].citation={type:'book'};samples[2].citation={type:'book'};
+const tidy=v=>String(v??'').replace(/[\u0000-\u001f\u007f]/g,' ').replace(/\s+/g,' ').trim();
+function cleanDOI(v){return tidy(v).replace(/^https?:\/\/(?:dx\.)?doi\.org\//i,'').replace(/^doi\s*:\s*/i,'').replace(/[.,;]+$/,'')}
+function validDOI(v){return /^10\.\d{4,9}\/[^\s<>"{}]+$/i.test(v)}
+function extractDOIs(text){return [...new Set((String(text).match(/10\.\d{4,9}\/[A-Z0-9._;()/:+-]+/gi)||[]).map(cleanDOI))].filter(validDOI)}
+function plainTitle(v){const s=tidy(v);return s.length>=8&&s.length<350&&!/^(untitled|microsoft|.*\.docx?$|.*\.pdf$|template|arxiv:)/i.test(s)?s:''}
+function authorNames(p){const c=p.citation||{};if(c.authorDisplay===p.authors&&c.authorList?.length)return c.authorList;return tidy(p.authors).split(/\s*[;；]\s*|\s+and\s+|\s*&\s*/i).filter(Boolean).map(name=>({literal:name}))}
+function personName(a,style){
+  if(a.literal){const s=tidy(a.literal);if(/[\u3400-\u9fff]/.test(s)||/et al\.?|等/.test(s)||s.includes(','))return s;const bits=s.split(' ');if(bits.length<2)return s;a={family:bits.pop(),given:bits.join(' ')}}
+  const family=tidy(a.family),given=tidy(a.given);if(/[\u3400-\u9fff]/.test(family+given))return family+given;
+  const initials=given.split(/[\s-]+/).filter(Boolean).map(x=>[...x][0].toUpperCase());
+  return style==='apa'?family+(initials.length?', '+initials.join('. ')+'.':''):family.toUpperCase()+(initials.length?' '+initials.join(' '):'');
+}
+function citationAuthors(p,style){const names=authorNames(p).map(a=>personName(a,style));if(!names.length)return '[作者待补充]';if(style==='gb')return names.slice(0,3).join(', ')+(names.length>3?', '+(/[\u3400-\u9fff]/.test(p.authors)?'等':'et al.'):'');if(names.length===1)return names[0];if(names.length>20)return names.slice(0,19).join(', ')+', … '+names.at(-1);return names.slice(0,-1).join(', ')+', & '+names.at(-1)}
+function missingCitation(p){const c=p.citation||{},m=[];if(!tidy(p.authors))m.push('作者');else if(/et al\.?|等/.test(p.authors))m.push('完整作者列表');if(!tidy(p.title))m.push('标题');if(!c.type||c.type==='unknown')m.push('文献类型');if(!/^\d{4}$/.test(c.year||''))m.push('出版年份');if(['article','chapter','conference'].includes(c.type)&&!c.container)m.push('期刊 / 会议录 / 书名');if(['book','chapter','thesis'].includes(c.type)&&!c.publisher)m.push('出版社 / 授予单位');if(['book','chapter','thesis'].includes(c.type)&&!c.place)m.push('出版地');if(c.type==='article'&&!c.pages)m.push('页码 / 文章编号');if(c.type==='chapter')m.push('编者（请在导出后补充）');if(c.type==='thesis')m.push('学位级别（请在导出后确认）');if(c.type==='preprint'&&!c.doi&&!c.url)m.push('文献网址');return m}
+function citationText(p,style='gb'){
+  const c=p.citation||{},authors=citationAuthors(p,style),title=tidy(p.title)||'[标题待补充]',year=c.year||'[年份待补充]',container=c.container||'[来源待补充]',publisher=c.publisher||'[出版者待补充]',link=c.doi?'https://doi.org/'+c.doi:c.url||'',pages=c.pages?': '+c.pages:'',volume=c.volume||'',issue=c.issue?'('+c.issue+')':'';
+  if(style==='apa'){
+    const date=c.year||'n.d.';let s=authors+' ('+date+'). '+title+(c.edition?' ('+c.edition+' ed.)':'')+'. ';
+    if(c.type==='article')s+=container+(volume?', '+volume:'')+issue+(c.pages?', '+c.pages:'')+'.';
+    else if(c.type==='book')s+=publisher+'.';
+    else if(c.type==='chapter')s+='In '+container+(c.pages?' (pp. '+c.pages+')':'')+'. '+publisher+'.';
+    else if(c.type==='conference')s+='In '+container+(c.pages?' (pp. '+c.pages+')':'')+(c.publisher?'. '+c.publisher:'')+'.';
+    else if(c.type==='thesis')s+='[学位论文, '+publisher+'].';
+    else if(c.type==='preprint')s+='[Preprint]'+(c.container?'. '+c.container:'')+'.';
+    else s+='[文献类型及来源待确认].';
+    return s+(link?' '+link:'');
+  }
+  const marker={article:'J',book:'M',chapter:'M',conference:'C',thesis:'D',preprint:'EB/OL',unknown:'Z'}[c.type]||'Z';
+  let s=authors+'. '+title+'['+marker+'].';
+  if(c.type==='article')s+=' '+container+', '+year+(volume?', '+volume:'')+issue+pages+'.';
+  else if(['book','thesis'].includes(c.type))s+=(c.edition?' '+c.edition+'版.':'')+' '+(c.place||'[出版地待补充]')+': '+publisher+', '+year+'.';
+  else if(c.type==='chapter')s=s.slice(0,-1)+'//'+container+'. '+(c.place||'[出版地待补充]')+': '+publisher+', '+year+pages+'.';
+  else if(c.type==='conference')s=s.slice(0,-1)+'//'+container+'. '+(c.publisher?(c.place?c.place+': ':'')+c.publisher+', ':'')+year+pages+'.';
+  else if(c.type==='preprint')s+=' ('+year+')['+new Date().toISOString().slice(0,10)+'].';
+  else s+=' '+year+'. [文献类型及来源待确认].';
+  return s+(link?' '+link+'.':'');
+}
+function bibEscape(v){return tidy(v).replace(/[\\{}%&#_$^~]/g,c=>({'\\':'\\textbackslash{}','{':'\\{','}':'\\}','%':'\\%','&':'\\&','#':'\\#','_':'\\_','$':'\\$','^':'\\textasciicircum{}','~':'\\textasciitilde{}'}[c]))}
+function exportCitation(p,format){
+  const c=p.citation||{};if(format==='txt')return citationText(p,citationStyle);
+  const names=authorNames(p);
+  if(format==='bib'){
+    const kind={article:'article',book:'book',chapter:'incollection',conference:'inproceedings'}[c.type]||'misc';
+    const fields={title:p.title,author:names.map(a=>a.literal?(a.literal.includes(',')?'{'+bibEscape(a.literal)+'}':bibEscape(a.literal)):bibEscape(a.family)+(a.given?', '+bibEscape(a.given):'')).join(' and '),year:c.year,[c.type==='article'?'journal':'booktitle']:c.container,publisher:c.type==='thesis'?'':c.publisher,school:c.type==='thesis'?c.publisher:'',address:c.place,volume:c.volume,number:c.issue,pages:c.pages,edition:c.edition,doi:c.doi,url:c.url};
+    return '@'+kind+'{paper'+hash(p.id||p.title)+',\n'+Object.entries(fields).filter(([,v])=>v).map(([k,v])=>'  '+k+' = {'+(k==='author'?v:bibEscape(v))+'}').join(',\n')+'\n}\n';
+  }
+  const kind={article:'JOUR',book:'BOOK',chapter:'CHAP',conference:'CPAPER',thesis:'THES',preprint:'UNPB'}[c.type]||'GEN';
+  const lines=['TY  - '+kind,'TI  - '+tidy(p.title),...names.map(a=>'AU  - '+tidy(a.literal||a.family+(a.given?', '+a.given:'')))];
+  const span=(c.pages||'').split(/[-–—]/);const fields={PY:c.year,T2:c.container,PB:c.publisher,CY:c.place,VL:c.volume,IS:c.issue,SP:span[0],EP:span.slice(1).join('-'),ET:c.edition,DO:c.doi,UR:c.url};
+  for(const [k,v]of Object.entries(fields))if(v)lines.push(k+'  - '+tidy(v));return lines.join('\r\n')+'\r\nER  - \r\n';
+}
+function downloadCitation(p,format){const data=exportCitation(p,format),url=URL.createObjectURL(new Blob([format==='txt'?'\ufeff'+data:data],{type:format==='ris'?'application/x-research-info-systems;charset=utf-8':format==='bib'?'application/x-bibtex;charset=utf-8':'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=(p.title||'reference').replace(/[<>:"/\\|?*\u0000-\u001f]/g,'_').slice(0,100)+'.'+format;a.click();setTimeout(()=>URL.revokeObjectURL(url),10000)}
+async function pdfEngine(){if(!pdfModulePromise)pdfModulePromise=import('https://cdn.jsdelivr.net/npm/pdfjs-dist@5.4.624/build/pdf.mjs').then(m=>{m.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@5.4.624/build/pdf.worker.mjs';return m}).catch(e=>{pdfModulePromise=null;throw e});return pdfModulePromise}
+function abortCheck(signal){if(signal?.aborted)throw new DOMException('已取消','AbortError')}
+function timeLimit(p,ms,signal){return new Promise((resolve,reject)=>{const finish=(fn,v)=>{clearTimeout(timer);signal?.removeEventListener('abort',cancel);fn(v)};const cancel=()=>finish(reject,new DOMException('已取消','AbortError'));const timer=setTimeout(()=>finish(reject,new Error('识别超时，请重试或手动填写')),ms);signal?.addEventListener('abort',cancel,{once:true});p.then(v=>finish(resolve,v),e=>finish(reject,e));if(signal?.aborted)cancel()})}
+function textLines(items){const rows=[];for(const i of items){if(!i.str?.trim())continue;const y=i.transform[5],size=Math.abs(i.height||i.transform[3]||10);let row=rows.find(r=>Math.abs(r.y-y)<Math.max(2,size*.25));if(!row){row={y,size,parts:[]};rows.push(row)}row.size=Math.max(row.size,size);row.parts.push({x:i.transform[4],text:i.str})}return rows.sort((a,b)=>b.y-a.y).map(r=>({...r,text:r.parts.sort((a,b)=>a.x-b.x).map(p=>p.text).join(' ').replace(/\s+/g,' ').trim()}))}
+function inferFrontMatter(lines,metadata={}){
+  const c={type:'unknown'},result={title:plainTitle(metadata.Title),authors:cleanAuthor(metadata.Author),citation:c};
+  const abstract=lines.findIndex(l=>/^(abstract|摘要|摘\s*要|introduction|1[.\s]+introduction)\b/i.test(l.text)||/^摘\s*要/.test(l.text));
+  const front=lines.slice(0,abstract>=0?abstract:Math.min(lines.length,30));
+  if(!result.title){const candidates=front.filter(l=>l.text.length>7&&!/arxiv|doi:|https?:|proceedings|journal|conference|copyright|©|^\d{4}\b/i.test(l.text));const max=Math.max(0,...candidates.map(l=>l.size));const titleRows=candidates.filter(l=>l.size>=max*.92);if(titleRows.length&&titleRows.length<5)result.title=plainTitle(titleRows.map(l=>l.text).join(' '))}
+  if(!result.authors&&result.title){const titleEnd=front.findLastIndex(l=>result.title.includes(l.text));const following=titleEnd>=0?front.slice(titleEnd+1,titleEnd+5):[];const names=following.map(l=>l.text.replace(/[\d*†‡]+/g,'').trim()).filter(t=>t&&!/university|institute|department|laboratory|school|google|research|@|https?:|学院|大学|研究所/i.test(t)&&(/^[A-ZÀ-ÖØ-Þ][\p{L}.'’ -]+(?:[,;&] ?[\p{L}.'’ -]+)*$/u.test(t)||/^[\u3400-\u9fff]{2,4}(?:[ ,，、;；]+[\u3400-\u9fff]{2,4})*$/.test(t)));if(names.length)result.authors=names.join('; ').replace(/\s*,\s*|\s*，\s*|\s*、\s*/g,'; ')}
+  const metadataDOIs=extractDOIs(Object.values(metadata).filter(v=>typeof v==='string').join(' '));
+  const frontText=front.map(l=>l.text).join('\n');const dois=metadataDOIs.length?metadataDOIs:extractDOIs(frontText);
+  if(dois.length===1)c.doi=dois[0];else if(dois.length>1)c.note='发现多个 DOI，未自动选取，请核对。';
+  const years=[...new Set([...frontText.matchAll(/\b(?:19|20)\d{2}\b/g)].map(m=>m[0]))].filter(y=>+y<=new Date().getFullYear()+1);
+  if(years.length===1)c.year=years[0];
+  const journal=frontText.match(/(?:journal|期刊)\s*[:：]\s*([^\n]+)/i);if(journal){c.type='article';c.container=tidy(journal[1])}
+  const volume=frontText.match(/\bVol(?:ume)?\.?\s*(\d+)/i),issue=frontText.match(/\b(?:Issue|No)\.?\s*(\d+)/i),pages=frontText.match(/\bpp?\.\s*(\d+\s*[-–]\s*\d+)/i);if(volume)c.volume=volume[1];if(issue)c.issue=issue[1];if(pages)c.pages=pages[1];
+  const arxiv=frontText.match(/arXiv\s*:\s*(\d{4}\.\d{4,5}(?:v\d+)?)/i);if(arxiv){c.type='preprint';c.container='arXiv';c.url='https://arxiv.org/abs/'+arxiv[1]}
+  c.source='PDF 元数据 / 首页文字（待核对）';return result;
+}
+async function crossrefDOI(doi,signal){
+  doi=cleanDOI(doi);if(!validDOI(doi))throw new Error('请先填写有效 DOI');
+  const controller=new AbortController(),cancel=()=>controller.abort(),timer=setTimeout(cancel,15000);signal?.addEventListener('abort',cancel,{once:true});
+  try{abortCheck(signal);const response=await fetch('https://api.crossref.org/works/'+encodeURIComponent(doi),{signal:controller.signal,referrerPolicy:'no-referrer'});if(!response.ok)throw new Error(response.status===404?'Crossref 没有收录这个 DOI':'联网查询失败，请稍后重试');const {message:m}=await response.json();if(cleanDOI(m.DOI).toLowerCase()!==doi.toLowerCase())throw new Error('DOI 返回结果不匹配');
+    const type={'journal-article':'article',book:'book',monograph:'book','edited-book':'book','book-chapter':'chapter','proceedings-article':'conference',dissertation:'thesis','posted-content':'preprint'}[m.type]||'unknown';
+    const authorList=(m.author||[]).map(a=>({family:tidy(a.family),given:tidy(a.given),...(a.name?{literal:tidy(a.name)}:{})})).filter(a=>a.family||a.literal);
+    const authors=authorList.map(a=>a.literal||(/[\u3400-\u9fff]/.test(a.family+a.given)?a.family+a.given:[a.given,a.family].filter(Boolean).join(' '))).join('; ');
+    const date=m['published-print']||m['published-online']||m.published||{};
+    return {title:tidy(m.title?.[0]),authors,citation:{type,year:String(date['date-parts']?.[0]?.[0]||''),container:tidy(m['container-title']?.[0]),publisher:tidy(m.publisher),place:tidy(m['publisher-location']),volume:tidy(m.volume),issue:tidy(m.issue),pages:tidy(m.page||m['article-number']),doi:cleanDOI(m.DOI),url:tidy(m.URL),authorList,authorDisplay:authors,source:'Crossref · DOI 精确匹配（请核对 PDF 版本）'}};
+  }catch(e){if(e.name==='AbortError'&&!signal?.aborted)throw new Error('联网查询超时，已保留本地识别结果');throw e}finally{clearTimeout(timer);signal?.removeEventListener('abort',cancel)}
+}
+async function ocrPages(doc,signal,onProgress){
+  if(!ocrModulePromise)ocrModulePromise=new Promise((ok,no)=>{if(window.Tesseract)return ok(window.Tesseract);const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';s.onload=()=>ok(window.Tesseract);s.onerror=()=>{s.remove();ocrModulePromise=null;no(new Error('OCR 组件下载失败'))};document.head.append(s)});
+  const engine=await timeLimit(ocrModulePromise,25000,signal);let worker;
+  let stopped=false;
+  try{onProgress('正在加载中英文 OCR，首次需要下载语言包…');const creation=engine.createWorker('eng+chi_sim',1,{logger:m=>{if(!stopped&&!signal?.aborted&&m.status==='recognizing text')onProgress('正在本地识别扫描页 '+Math.round(m.progress*100)+'%')}}).then(w=>{if(stopped){w.terminate();throw new Error('OCR 已取消')}return w});worker=await timeLimit(creation,90000,signal);abortCheck(signal);const lines=[];
+    for(let i=1;i<=Math.min(2,doc.numPages);i++){abortCheck(signal);const page=await doc.getPage(i),base=page.getViewport({scale:1}),viewport=page.getViewport({scale:Math.min(2,2200/Math.max(base.width,base.height))}),canvas=document.createElement('canvas');canvas.width=Math.ceil(viewport.width);canvas.height=Math.ceil(viewport.height);await page.render({canvasContext:canvas.getContext('2d'),viewport}).promise;const {data}=await timeLimit(worker.recognize(canvas),90000,signal);lines.push(...data.text.split('\n').filter(Boolean).map((text,j)=>({text:tidy(text),size:12,y:1000-j*14})));canvas.width=canvas.height=0}return lines;
+  }finally{stopped=true;if(worker)await worker.terminate()}
+}
+async function recognizePDF(file,{online=false,ocr=false,signal,onProgress=()=>{}}={}){
+  let doc,task;let result={title:'',authors:'',citation:{type:'unknown'}};
+  try{
+    onProgress('正在本地读取 PDF 元数据与前两页…');const engine=await timeLimit(pdfEngine(),25000,signal);abortCheck(signal);
+    task=engine.getDocument({data:new Uint8Array(await file.arrayBuffer()),isEvalSupported:false,useSystemFonts:true,cMapUrl:'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.4.624/cmaps/',cMapPacked:true,standardFontDataUrl:'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.4.624/standard_fonts/'});
+    doc=await timeLimit(task.promise,25000,signal);const metadata=await doc.getMetadata();const pages=[];
+    for(let i=1;i<=Math.min(2,doc.numPages);i++){abortCheck(signal);const page=await doc.getPage(i);pages.push(textLines((await timeLimit(page.getTextContent(),20000,signal)).items))}
+    let lines=pages[0]||[];let scanned=pages.flat().map(l=>l.text).join('').length<60;
+    if(scanned&&ocr){lines=await ocrPages(doc,signal,onProgress);scanned=false}
+    result=inferFrontMatter(lines,metadata.info||{});
+    if(!result.authors){const author=await detectAuthor(file);result.authors=author.author}
+    if(!result.citation.doi){const early=pages.flat().filter(l=>/doi\s*[:：]|doi\.org\//i.test(l.text));const ids=extractDOIs(early.map(l=>l.text).join(' '));if(ids.length===1)result.citation.doi=ids[0]}
+    result.citation.scanned=scanned;
+    if(scanned)result.citation.note='未读到足够文字，可能是扫描件。可用「扫描件 OCR」或手动补充。';
+    if(ocr)result.citation.source='本地 PDF / OCR（识别文字可能有误，请核对）';
+    if(online&&result.citation.doi){onProgress('正在用 DOI 查询出版信息（不上传 PDF）…');try{const matched=await crossrefDOI(result.citation.doi,signal);result={title:matched.title||result.title,authors:matched.authors||result.authors,citation:{...result.citation,...matched.citation,note:result.citation.note||''}}}catch(e){abortCheck(signal);result.citation.note=e.message}}
+    return result;
+  }catch(e){abortCheck(signal);const fallback=await detectAuthor(file);return {...result,authors:result.authors||fallback.author,citation:{...result.citation,note:'完整识别未完成：'+(e.name==='PasswordException'?'PDF 已加密，请先解锁。':e.message)+'。可手动补充。'}}}
+  finally{if(task)try{await task.destroy()}catch(e){}}
+}
+function fieldsMarkup(prefix){return CITE_FIELDS.map(([key,label])=>'<label class="'+(['container','doi','url'].includes(key)?'wide':'')+'">'+label+(key==='type'?'<select class="field" data-cite-field="type" id="'+prefix+'type">'+Object.entries(CITE_TYPES).map(([v,n])=>'<option value="'+v+'">'+n+'</option>').join('')+'</select>':'<input class="field" data-cite-field="'+key+'" id="'+prefix+key+'" maxlength="'+(key==='url'?1000:400)+'" '+(key==='year'?'inputmode="numeric" placeholder="例如：2024"':'')+'>')+'</label>').join('')}
+function fillCiteFields(c={}){document.querySelectorAll('#citationEditor [data-cite-field]').forEach(el=>{el.value=c[el.dataset.citeField]||(el.dataset.citeField==='type'?'unknown':'');el.dataset.dirty=''})}
+function readCiteFields(base={}){const c={...base};document.querySelectorAll('#citationEditor [data-cite-field]').forEach(el=>c[el.dataset.citeField]=tidy(el.value));c.doi=cleanDOI(c.doi);return c}
+function validCiteFields(c){if(c.year&&!/^(18|19|20|21)\d{2}$/.test(c.year))return '出版年份请填写四位数字';if(c.doi&&!validDOI(c.doi))return 'DOI 格式应类似 10.1234/example';if(c.url&&!/^https?:\/\/\S+$/i.test(c.url))return '文献网址请以 https:// 或 http:// 开头';return ''}
+const editor=document.createElement('details');editor.id='citationEditor';editor.className='citation-fields';editor.innerHTML='<summary>参考文献信息 · 可展开校正</summary><div class="citation-fields-grid">'+fieldsMarkup('cite-')+'</div><p class="citation-note">作者之间请用分号分隔；出版年份不会使用 PDF 创建日期代替。</p>';
+$('#metaForm .form').append(editor);
+editor.addEventListener('input',e=>{if(e.target.dataset.citeField)e.target.dataset.dirty='true'});
+const options=document.createElement('div');options.className='recognition-options';options.innerHTML='<label><input type="checkbox" id="doiOnline">允许用 DOI 联网补全出版信息</label><small>PDF 和首页文字只在本机处理；勾选后仅向 Crossref 发送识别到的 DOI。解析组件首次使用需联网加载。扫描版可在收入后使用 OCR。</small>';
+$('#metaNote').after(options);
+let onlineSetting=false;try{onlineSetting=localStorage.getItem('paper-vault-doi-online')==='yes'}catch(e){}$('#doiOnline').checked=onlineSetting;
+$('#doiOnline').onchange=()=>{try{localStorage.setItem('paper-vault-doi-online',$('#doiOnline').checked?'yes':'no')}catch(e){}};
+const progress=document.createElement('div');progress.id='recognitionProgress';progress.setAttribute('role','status');options.after(progress);
+$('#paperTitle').addEventListener('input',()=>$('#paperTitle').dataset.dirty='true');
+dialog.addEventListener('close',()=>{recognitionController?.abort();recognizing=false;$('#saveBtn').disabled=false});
+
+pick=async function(files){
+  if(!db||busy)return;const valid=[...files].filter(f=>f.type==='application/pdf'||f.name.toLowerCase().endsWith('.pdf'));if(!valid.length)return notify('请选择 PDF 文件');
+  recognitionController?.abort();recognitionController=new AbortController();const signal=recognitionController.signal;
+  closeDetail();editingId=null;currentFiles=valid;importDrafts=valid.map(()=>({citation:{type:'unknown'}}));const version=++importVersion,multiple=valid.length>1;
+  $('#metaHeading').textContent=multiple?'收入 '+valid.length+' 篇论文':'收入一篇论文';$('#metaNote').textContent='自动识别文献信息并生成引用；识别结果请核对，缺失信息可随时补充。';options.hidden=false;
+  $('#paperTitle').value=multiple?'逐篇识别标题':valid[0].name.replace(/\.pdf$/i,'').replace(/_/g,' ');$('#paperTitle').disabled=multiple;$('#paperTitle').dataset.dirty='';
+  $('#paperAuthors').value='';$('#paperAuthors').dataset.dirty='';$('#paperAuthors').placeholder='作者之间用分号分隔';$('#authorLabel').hidden=multiple;$('#batchAuthors').replaceChildren();$('#authorStatus').textContent='正在识别…';$('#paperTags').value='';fillCiteFields();editor.hidden=multiple;editor.open=false;
+  $('#formError').textContent='';$('#saveBtn').textContent='识别中…';$('#saveBtn').disabled=true;recognizing=true;
+  const fields=valid.map((f,i)=>{if(!multiple)return {title:$('#paperTitle'),authors:$('#paperAuthors'),status:$('#authorStatus')};const row=document.createElement('div');row.className='batch-item';row.innerHTML='<span class="batch-title">'+safe(f.name)+'</span><label>标题<input data-batch-title="'+i+'" aria-label="第 '+(i+1)+' 篇标题" maxlength="350"></label><label>作者<input data-batch-author="'+i+'" aria-label="第 '+(i+1)+' 篇作者" placeholder="作者之间用分号分隔" maxlength="1500"></label><small role="status">等待识别…</small>';$('#batchAuthors').append(row);const title=row.querySelector('[data-batch-title]'),authors=row.querySelector('[data-batch-author]');title.value=f.name.replace(/\.pdf$/i,'');[title,authors].forEach(el=>el.oninput=()=>el.dataset.dirty='true');return {title,authors,status:row.querySelector('small')}});
+  $('#paperAuthors').maxLength=1500;dialog.showModal();
+  try{for(let i=0;i<valid.length;i++){abortCheck(signal);const f=fields[i];const result=await recognizePDF(valid[i],{online:$('#doiOnline').checked,signal,onProgress:message=>{if(version===importVersion&&!signal.aborted)progress.textContent=(multiple?(i+1)+' / '+valid.length+' · ':'')+message}});if(version!==importVersion||!dialog.open)return;importDrafts[i]=result;
+    if(f.title.dataset.dirty!=='true'&&result.title)f.title.value=result.title;if(f.authors.dataset.dirty!=='true')f.authors.value=result.authors||'';
+    f.status.textContent=(result.citation.source||'PDF 识别')+'。'+(result.citation.note||'请核对后保存。');
+    if(!multiple)document.querySelectorAll('#citationEditor [data-cite-field]').forEach(el=>{if(el.dataset.dirty!=='true')el.value=result.citation[el.dataset.citeField]||(el.dataset.citeField==='type'?'unknown':'')});
+  }if(version===importVersion)progress.textContent='识别完成。收入后即可查看、复制和导出参考文献。'}catch(e){if(e.name!=='AbortError')progress.textContent='识别未完成，可手动填写后保存。'}finally{if(version===importVersion){recognizing=false;$('#saveBtn').disabled=false;$('#saveBtn').textContent='收入书架 ↗'}}
+};
+const baseEditPaper=editPaper;
+editPaper=function(){baseEditPaper();const p=find(editingId);if(!p)return;recognitionController?.abort();recognizing=false;$('#saveBtn').disabled=false;options.hidden=true;progress.textContent='';editor.hidden=false;fillCiteFields(p.citation);editor.open=true;$('#paperAuthors').maxLength=1500;$('#paperAuthors').placeholder='作者之间用分号分隔'};
+saveFiles=async function(e){
+  e.preventDefault();if(busy||recognizing)return;const title=$('#paperTitle').value.trim(),authors=$('#paperAuthors').value.trim(),tags=[...new Set($('#paperTags').value.split(/[,，]/).map(t=>t.trim()).filter(Boolean))];if(!title){$('#formError').textContent='请填写标题';return}
+  const citation=readCiteFields(editingId?find(editingId)?.citation:importDrafts[0]?.citation);if((editingId||currentFiles.length===1)&&validCiteFields(citation)){$('#formError').textContent=validCiteFields(citation);return}
+  busy=true;$('#saveBtn').disabled=$('#cancelMeta').disabled=true;$('#formError').textContent='';
+  try{if(editingId){const p=find(editingId);await put({...p,title,authors,tags,citation})}else{const records=currentFiles.map((f,i)=>{const draft=importDrafts[i]||{};return {id:crypto.randomUUID(),title:currentFiles.length===1?title:($('[data-batch-title="'+i+'"]').value.trim()||f.name.replace(/\.pdf$/i,'')),authors:currentFiles.length===1?authors:$('[data-batch-author="'+i+'"]').value.trim(),citation:currentFiles.length===1?citation:draft.citation||{},tags,starred:false,added:Date.now()+i,size:f.size,file:f}});await mutate(s=>records.forEach(p=>s.put(p)))}const id=editingId,msg=editingId?'文献信息和引用已更新':'已收入 '+currentFiles.length+' 篇论文';dialog.close();currentFiles=[];await refresh();notify(msg);if(id)showDetail(id)}catch(err){$('#formError').textContent='保存失败，请检查浏览器存储空间后重试。'}finally{busy=false;$('#saveBtn').disabled=$('#cancelMeta').disabled=false}
+};
+$('#metaForm').onsubmit=saveFiles;
+
+function citationPanel(p){const missing=missingCitation(p),c=p.citation||{};return '<section class="citation-panel" aria-label="参考文献"><div class="citation-heading"><h3>参考文献</h3><select class="field" id="citationStyle" aria-label="参考文献格式"><option value="gb" '+(citationStyle==='gb'?'selected':'')+'>GB/T 7714—2015</option><option value="apa" '+(citationStyle==='apa'?'selected':'')+'>APA 7 · 纯文本</option></select></div><div class="citation-preview" id="citationPreview">'+safe(citationText(p,citationStyle))+'</div><p class="citation-note '+(missing.length?'citation-warning':'')+'" id="citationCompleteness">'+(missing.length?'引用草稿 · 待补充：'+safe(missing.join('、')):'引用已生成 · 提交前请核对作者、出版信息和 PDF 版本。')+'</p><div class="citation-actions"><button class="save" data-citation-action="copy">复制引用</button><button class="ghost" data-citation-action="txt">导出 TXT</button><button class="ghost" data-citation-action="bib">BibTeX</button><button class="ghost" data-citation-action="ris">RIS</button></div><p class="citation-note" id="citationStatus" role="status">'+safe(p.demo?'示例预览；导入 PDF 后可自动识别与校正。':(c.source||'尚未识别这份 PDF，可点击下方按钮。')+(c.note?' · '+c.note:''))+'</p>'+(p.demo?'':'<div class="citation-actions"><button class="ghost" data-citation-action="recognize">'+(citationJobs.has(p.id)?'识别中…':'识别 PDF')+'</button><button class="ghost" data-citation-action="lookup">用 DOI 联网补全</button><button class="ghost" data-citation-action="ocr">扫描件 OCR</button><button class="ghost" data-citation-action="edit">校正文献信息</button></div><p class="citation-note">PDF 不上传。DOI 补全仅发送 DOI；OCR 在本地运行，首次需下载中英文语言包。识别只填充空白项，保留你的已有信息。</p>')+'</section>'}
+const baseShowDetail=showDetail;
+showDetail=function(id){baseShowDetail(id);const p=find(id);if(!p)return;$('#detailContent').insertAdjacentHTML('beforeend',citationPanel(p));$('#citationStyle').onchange=e=>{citationStyle=e.target.value;$('#citationPreview').textContent=citationText(find(selectedId),citationStyle)};if(citationJobs.has(id))$('#detailContent').querySelectorAll('[data-citation-action]').forEach(b=>{b.disabled=true})};
+function fillMissingPaper(p,r){const citation={...p.citation};for(const [k,v]of Object.entries(r.citation||{}))if((!citation[k]||citation[k]==='unknown')&&v)citation[k]=v;citation.source=r.citation?.source||citation.source;citation.note=r.citation?.note||'';return {...p,title:p.title||r.title,authors:p.authors||r.authors,citation}}
+$('#detailContent').addEventListener('click',async e=>{
+  const b=e.target.closest('[data-citation-action]');if(!b)return;const p=find(selectedId);if(!p)return;const action=b.dataset.citationAction;
+  if(action==='edit')return editPaper();
+  if(action==='copy'){try{await navigator.clipboard.writeText(citationText(p,citationStyle));notify(missingCitation(p).length?'引用草稿已复制，请补齐缺失项':'参考文献已复制')}catch(e){const range=document.createRange();range.selectNodeContents($('#citationPreview'));const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);notify('已选中引用，请按 ⌘C / Ctrl+C 复制')}return}
+  if(['txt','bib','ris'].includes(action)){downloadCitation(p,action);if(missingCitation(p).length)notify('已导出引用草稿，部分出版信息仍需补充');return}
+  if(p.demo||citationJobs.has(p.id))return;
+  if(action==='lookup'&&!validDOI(p.citation?.doi||'')){notify('请先识别 PDF，或在「校正文献信息」填写 DOI');return}
+  citationJobs.add(p.id);$('#detailContent').querySelectorAll('[data-citation-action]').forEach(el=>el.disabled=true);
+  const status=message=>{if(selectedId===p.id&&$('#citationStatus'))$('#citationStatus').textContent=message};
+  try{status(action==='lookup'?'正在查询 Crossref，仅发送 DOI…':'正在本地识别…');const result=action==='lookup'?await crossrefDOI(p.citation.doi):await recognizePDF(p.file,{online:$('#doiOnline').checked,ocr:action==='ocr',onProgress:status});
+    // Re-read after async work so a concurrent edit/star/delete is never overwritten.
+    const latest=(await all()).find(x=>x.id===p.id);if(!latest)return;await put(fillMissingPaper(latest,result));await refresh();if(selectedId===p.id&&$('#detailDialog').open){citationJobs.delete(p.id);showDetail(p.id)}notify('识别完成；已有信息保留，请核对参考文献');
+  }catch(err){status('未完成：'+err.message);notify('识别未完成，现有资料未改动')}finally{citationJobs.delete(p.id);if(selectedId===p.id)$('#detailContent').querySelectorAll('[data-citation-action]').forEach(el=>el.disabled=false)}
+});
+
+</script>
+<!-- citation-upgrade:end -->
 </body>
 </html>
